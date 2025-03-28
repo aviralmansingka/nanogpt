@@ -303,6 +303,7 @@ def run_model():
             f.write(requests.get(url).text)
             print("Downloaded tiny shakespeare dataset")
 
+    torch.set_float32_matmul_precision("high")
     torch.manual_seed(1337)
     if torch.backends.mps.is_available() and torch.backends.mps.is_built():
         device = torch.device("mps")
