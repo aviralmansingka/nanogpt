@@ -6,8 +6,7 @@ import os
 import time
 
 import torch
-from torch._prims_common import DeviceLikeType
-from torch.distributed import is_available
+from torch.profiler import profile, ProfilerActivity, record_function, schedule
 import torch.nn as nn
 from torch.nn import functional as F
 
@@ -17,6 +16,7 @@ app = modal.App("gpt2-initial-prompts")
 image = modal.Image.debian_slim("3.11.9").pip_install_from_requirements(
     "./requirements.txt"
 )
+traces = modal.Volume.from_name("traces", create_if_missing=True)
 
 
 class MLP(nn.Module):
@@ -102,8 +102,10 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        with record_function("Block::attn"):
+            x = x + self.attn(self.ln_1(x))
+        with record_function("Block::mlp"):
+            x = x + self.mlp(self.ln_2(x))
         return x
 
 
@@ -151,25 +153,33 @@ class GPT(nn.Module):
             f"Cannot forward sequence of length {T}, block_size is only {self.config.block_size}"
         )
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
-        # Static position embeddings irrespective of inputs
-        # position embedding (T, n_embd)
-        pos_emb = self.transformer.wpe(pos)
-        # token embeddings (B, T, n_embd)
-        tok_emb = self.transformer.wte(idx)
-        # Broadcast pos_emb and add it to each prompt in B
-        x = tok_emb + pos_emb
+        with record_function("GPT::embeddings"):
+            # Static position embeddings irrespective of inputs
+            # position embedding (T, n_embd)
+            pos_emb = self.transformer.wpe(pos)
+            # token embeddings (B, T, n_embd)
+            tok_emb = self.transformer.wte(idx)
+            # Broadcast pos_emb and add it to each prompt in B
+            x = tok_emb + pos_emb
 
-        for block in self.transformer.h:
-            # Successively apply transformer blocks
-            x = block(x)
+        with record_function("GPT::transformers"):
+            for block in self.transformer.h:
+                # Successively apply transformer blocks
+                x = block(x)
 
-        # forward the final layernorm and the classifier
-        x = self.transformer.ln_f(x)
-        # (B, T, vocab_size)
-        logits = self.lm_head(x)
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            # forward the final layernorm and the classifier
+            x = self.transformer.ln_f(x)
+
+        with record_function("GPT::lm_head"):
+            # (B, T, vocab_size)
+            logits = self.lm_head(x)
+
+        with record_function("GPT::loss"):
+            loss = None
+            if targets is not None:
+                loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)), targets.view(-1)
+                )
 
         return logits, loss
 
@@ -293,7 +303,7 @@ def _generate_next_token(model: nn.Module, x: torch.Tensor):
     x = torch.cat((x, xcol), dim=1)
 
 
-@app.function(gpu="A100", image=image)
+@app.function(gpu="A100", image=image, volumes={"/mnt/traces": traces})
 def run_model():
     if not os.path.exists("input.txt"):
         import requests
@@ -303,42 +313,63 @@ def run_model():
             f.write(requests.get(url).text)
             print("Downloaded tiny shakespeare dataset")
 
+    torch.set_float32_matmul_precision("high")
     torch.manual_seed(1337)
     if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        device = torch.device("mps")
+        device = "mps"
         torch.mps.manual_seed(1337)
     elif torch.backends.cuda.is_built():
-        device = torch.device("cuda")
+        device = "cuda"
         torch.cuda.manual_seed(1337)
     else:
-        device = torch.device("cpu")
+        device = "cpu"
 
     train_loader = DataLoaderLite(B=16, T=1024)
 
-    model = GPT.from_pretrained("gpt2")
+    model = GPT(GPTConfig)
     model.eval()
     model.to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
-    for i in range(10):
-        t0 = time.time()
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        with_stack=True,
+        with_modules=True,
+        with_flops=True,
+        record_shapes=True,
+        schedule=schedule(wait=1, warmup=1, active=2, repeat=1),
+    ) as prof:
+        prof.start()
         optimizer.zero_grad()
-        _, loss = model(x, y)
-        loss.backward()
-        optimizer.step()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        elif torch.mps.is_available():
-            torch.mps.synchronize()
-        t1 = time.time()
-        dt = (t1 - t0) * 1000
-        tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-        print(
-            f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}"
-        )
+        for i in range(10):
+            t0 = time.time()
+            with record_function("load_data"):
+                x, y = train_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+            with record_function("next_token_pred"):
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    _, loss = model(x, y)
+
+            with record_function("grad_update"):
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+
+            with record_function("cleanup"):
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                elif torch.mps.is_available():
+                    torch.mps.synchronize()
+                t1 = time.time()
+                dt = (t1 - t0) * 1000
+                tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+                print(
+                    f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}"
+                )
+                prof.step()
+
+    prof.export_chrome_trace(f"/mnt/traces/trace_{time.strftime('%Y%m%d_%H%M%S')}.json")
 
 
 @app.local_entrypoint()
