@@ -319,6 +319,7 @@ def run_model():
     model = GPT.from_pretrained("gpt2")
     model.eval()
     model.to(device)
+    model = torch.compile(model)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
