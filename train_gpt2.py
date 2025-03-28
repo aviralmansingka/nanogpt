@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import assert_type
 
 import math
+import os
 
 import torch
 from torch._prims_common import DeviceLikeType
@@ -128,7 +129,7 @@ class GPT(nn.Module):
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, (
             f"Cannot forward sequence of length {T}, block_size is only {self.config.block_size}"
@@ -150,7 +151,11 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
         # (B, T, vocab_size)
         logits = self.lm_head(x)
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -216,10 +221,38 @@ class GPT(nn.Module):
         return model
 
 
+def _generate_next_token(model: nn.Module, x: torch.Tensor):
+    __import__("ipdb").set_trace()
+    # (B, T, vocab_size)
+    logits, _ = model(x)
+    # (B, vocab_size) using last token
+    logits = logits[:, -1, :]
+    probs = F.softmax(logits, dim=-1)
+
+    # filter out only top-50 to "steer" model
+    topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+
+    # predict next token using the top ones
+    ix = torch.multinomial(topk_probs, 1)  # (B, 1)
+
+    # (B, 1)
+    xcol = torch.gather(topk_indices, -1, ix)
+
+    x = torch.cat((x, xcol), dim=1)
+
+
 @app.function(gpu="L40S", image=image)
 def run_model():
     NUM_SEQUENCES = 5
     MAX_LENGTH = 30
+
+    if not os.path.exists("input.txt"):
+        import requests
+
+        url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+        with open("input.txt", "w") as f:
+            f.write(requests.get(url).text)
+            print("Downloaded tiny shakespeare dataset")
 
     if torch.backends.mps.is_available() and torch.backends.mps.is_built():
         device = torch.device("mps")
@@ -235,6 +268,28 @@ def run_model():
     import tiktoken
 
     enc = tiktoken.get_encoding("gpt2")
+    with open("input.txt", "r") as f:
+        text = f.read()
+
+    text = text[:1000]
+    tokens = enc.encode(text)
+
+    B, T = 4, 32
+    buf = torch.tensor(tokens[: B * T + 1]).to(device)
+    x = buf[:-1].view(B, T).to(device)
+    y = buf[1:].view(B, T).to(device)
+    logits, loss = model(x, targets=y)
+    print(logits.shape)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+    for i in range(50):
+        optimizer.zero_grad()
+        logits, loss = model(x, y)
+        loss.backward()
+        optimizer.step()
+        print(f"step {i}, loss: {loss.item()}")
+
     tokens = enc.encode("Hello, I'm a language model,")
     tokens = torch.tensor(tokens, dtype=torch.long)
     tokens = tokens.unsqueeze(0).repeat(NUM_SEQUENCES, 1)
@@ -242,22 +297,7 @@ def run_model():
 
     while x.size(1) < MAX_LENGTH:
         with torch.no_grad():
-            # (B, T, vocab_size)
-            logits = model(x)
-            # (B, vocab_size) using last token
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-
-            # filter out only top-50 to "steer" model
-            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-
-            # predict next token using the top ones
-            ix = torch.multinomial(topk_probs, 1)  # (B, 1)
-
-            # (B, 1)
-            xcol = torch.gather(topk_indices, -1, ix)
-
-            x = torch.cat((x, xcol), dim=1)
+            _generate_next_token(model, x)
 
     for i in range(NUM_SEQUENCES):
         tokens = x[i, :MAX_LENGTH].tolist()
@@ -266,5 +306,9 @@ def run_model():
 
 
 @app.local_entrypoint()
-def main():
+def trigger_on_modal():
     run_model.remote()
+
+
+if __name__ == "__main__":
+    run_model.local()
