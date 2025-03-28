@@ -4,8 +4,17 @@ from typing import assert_type
 import math
 
 import torch
+from torch._prims_common import DeviceLikeType
+from torch.distributed import is_available
 import torch.nn as nn
 from torch.nn import functional as F
+
+import modal
+
+app = modal.App("gpt2-initial-prompts")
+image = modal.Image.debian_slim("3.11.9").pip_install_from_requirements(
+    "./requirements.txt"
+)
 
 
 class MLP(nn.Module):
@@ -73,7 +82,7 @@ class CausalSelfAttention(nn.Module):
         # (B, num_head, T, T) x (B, num_head, T, dim_attn)
         # = (B, num_head, T, dim_attn)
         y = attn @ v
-        y = y.transpose(1, 2).continguous().view(B, T, C)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y
         # Re-assemble all attention heads
@@ -118,6 +127,30 @@ class GPT(nn.Module):
         )
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+    def forward(self, idx):
+        B, T = idx.size()
+        assert T <= self.config.block_size, (
+            f"Cannot forward sequence of length {T}, block_size is only {self.config.block_size}"
+        )
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        # Static position embeddings irrespective of inputs
+        # position embedding (T, n_embd)
+        pos_emb = self.transformer.wpe(pos)
+        # token embeddings (B, T, n_embd)
+        tok_emb = self.transformer.wte(idx)
+        # Broadcast pos_emb and add it to each prompt in B
+        x = tok_emb + pos_emb
+
+        for block in self.transformer.h:
+            # Successively apply transformer blocks
+            x = block(x)
+
+        # forward the final layernorm and the classifier
+        x = self.transformer.ln_f(x)
+        # (B, T, vocab_size)
+        logits = self.lm_head(x)
+        return logits
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -183,5 +216,55 @@ class GPT(nn.Module):
         return model
 
 
-model = GPT.from_pretrained("gpt2")
-print("didn't crash yay")
+@app.function(gpu="L40S", image=image)
+def run_model():
+    NUM_SEQUENCES = 5
+    MAX_LENGTH = 30
+
+    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        device = torch.device("mps")
+    elif torch.backends.cuda.is_built():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
+    model = GPT.from_pretrained("gpt2")
+    model.eval()
+    model.to(device)
+
+    import tiktoken
+
+    enc = tiktoken.get_encoding("gpt2")
+    tokens = enc.encode("Hello, I'm a language model,")
+    tokens = torch.tensor(tokens, dtype=torch.long)
+    tokens = tokens.unsqueeze(0).repeat(NUM_SEQUENCES, 1)
+    x = tokens.to(device)
+
+    while x.size(1) < MAX_LENGTH:
+        with torch.no_grad():
+            # (B, T, vocab_size)
+            logits = model(x)
+            # (B, vocab_size) using last token
+            logits = logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1)
+
+            # filter out only top-50 to "steer" model
+            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+
+            # predict next token using the top ones
+            ix = torch.multinomial(topk_probs, 1)  # (B, 1)
+
+            # (B, 1)
+            xcol = torch.gather(topk_indices, -1, ix)
+
+            x = torch.cat((x, xcol), dim=1)
+
+    for i in range(NUM_SEQUENCES):
+        tokens = x[i, :MAX_LENGTH].tolist()
+        decoded = enc.decode(tokens)
+        print(">", decoded)
+
+
+@app.local_entrypoint()
+def main():
+    run_model.remote()
