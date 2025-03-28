@@ -306,13 +306,13 @@ def run_model():
     torch.set_float32_matmul_precision("high")
     torch.manual_seed(1337)
     if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        device = torch.device("mps")
+        device = "mps"
         torch.mps.manual_seed(1337)
     elif torch.backends.cuda.is_built():
-        device = torch.device("cuda")
+        device = "cuda"
         torch.cuda.manual_seed(1337)
     else:
-        device = torch.device("cpu")
+        device = "cpu"
 
     train_loader = DataLoaderLite(B=16, T=1024)
 
@@ -327,7 +327,8 @@ def run_model():
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
-        _, loss = model(x, y)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            _, loss = model(x, y)
         loss.backward()
         optimizer.step()
         if torch.cuda.is_available():
