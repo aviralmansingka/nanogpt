@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import assert_type
 
+import inspect
 import math
 import os
 import time
@@ -75,18 +76,18 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
         # # (B, n_head, T, n_embd) x (B, n_head, n_embd, T) = (B, n_head, T, T)
-        with record_function("attn:head"):
-            attn = q @ k.transpose(-2, -1)
-            # Scale by 1 / sqrt(num_embd)
-            attn = attn * (1.0 / math.sqrt(k.size(-1)))
-            # create mask for preventing future tokens from leaking in
-            # Use -inf here to remove instead of zero as next step is softmax
-            attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-            # Softmax over each column
-            attn = F.softmax(attn, dim=-1)
-            # (B, num_head, T, T) x (B, num_head, T, dim_attn)
-            # = (B, num_head, T, dim_attn)
-            y = attn @ v
+        # with record_function("attn:head"):
+        #     attn = q @ k.transpose(-2, -1)
+        #     # Scale by 1 / sqrt(num_embd)
+        #     attn = attn * (1.0 / math.sqrt(k.size(-1)))
+        #     # create mask for preventing future tokens from leaking in
+        #     # Use -inf here to remove instead of zero as next step is softmax
+        #     attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        #     # Softmax over each column
+        #     attn = F.softmax(attn, dim=-1)
+        #     # (B, num_head, T, T) x (B, num_head, T, dim_attn)
+        #     # = (B, num_head, T, dim_attn)
+        #     y = attn @ v
 
         with record_function("attn:head"):
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -251,6 +252,34 @@ class GPT(nn.Module):
 
         return model
 
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start with all the candidate params that require grad
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters with 2D will be decayed
+        # i.e. all biases and all layernorms don't
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_group = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+
+        print(f"num decayed params: {len(decay_params)}, params: {num_decay_params}")
+        print(
+            f"num nodecayed params: {len(nodecay_params)}, params: {num_nodecay_params}"
+        )
+        # Use kernel fusion for loss calculation
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and "cuda" in device
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(
+            optim_group, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused
+        )
+        return optimizer
+
 
 class DataLoaderLite:
     def __init__(self, B, T):
@@ -308,6 +337,26 @@ def _generate_next_token(model: nn.Module, x: torch.Tensor):
     x = torch.cat((x, xcol), dim=1)
 
 
+MAX_LR = 3e-4
+MIN_LR = MAX_LR * 0.1
+WARMUP_STEPS = 10
+MAX_STEPS = 50
+
+
+def get_lr(it):
+    # 1) Linear warmup for warmup_iters steps
+    if it < WARMUP_STEPS:
+        return MAX_LR * (it + 1) / WARMUP_STEPS
+    # 2) If it > lr_decay_iters, return min learning rate
+    if it > MAX_STEPS:
+        return MIN_LR
+    # 3) In between, use cosine decay down to min_lr
+    decay_ratio = (it - WARMUP_STEPS) / (MAX_STEPS - WARMUP_STEPS)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return MIN_LR + coeff * (MAX_LR - MIN_LR)
+
+
 @app.function(gpu="A100", image=image, volumes={"/mnt/traces": traces})
 def run_model():
     if not os.path.exists("input.txt"):
@@ -334,12 +383,14 @@ def run_model():
     model = GPT(GPTConfig())
     model.eval()
     model.to(device)
+    model: GPT = torch.compile(model)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    optimizer = model.configure_optimizers(
+        weight_decay=0.1, learning_rate=6e-4, device=device
+    )
 
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        with_stack=True,
         with_modules=True,
         with_flops=True,
         record_shapes=True,
@@ -347,7 +398,7 @@ def run_model():
     ) as prof:
         prof.start()
         optimizer.zero_grad()
-        for i in range(10):
+        for step in range(10):
             t0 = time.time()
             with record_function("load_data"):
                 x, y = train_loader.next_batch()
@@ -358,6 +409,10 @@ def run_model():
 
             with record_function("grad_update"):
                 loss.backward()
+                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                lr = get_lr(step)
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = lr
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -370,7 +425,7 @@ def run_model():
                 dt = (t1 - t0) * 1000
                 tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
                 print(
-                    f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}"
+                    f"step {step} | loss: {loss.item()} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
                 )
                 prof.step()
 
