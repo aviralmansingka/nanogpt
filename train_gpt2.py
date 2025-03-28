@@ -74,23 +74,28 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # (B, n_head, T, n_embd) x (B, n_head, n_embd, T) = (B, n_head, T, T)
-        attn = q @ k.transpose(-2, -1)
-        # Scale by 1 / sqrt(num_embd)
-        attn = attn * (1.0 / math.sqrt(k.size(-1)))
-        # create mask for preventing future tokens from leaking in
-        # Use -inf here to remove instead of zero as next step is softmax
-        attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        # Softmax over each column
-        attn = F.softmax(attn, dim=-1)
-        # (B, num_head, T, T) x (B, num_head, T, dim_attn)
-        # = (B, num_head, T, dim_attn)
-        y = attn @ v
+        # # (B, n_head, T, n_embd) x (B, n_head, n_embd, T) = (B, n_head, T, T)
+        with record_function("attn:head"):
+            attn = q @ k.transpose(-2, -1)
+            # Scale by 1 / sqrt(num_embd)
+            attn = attn * (1.0 / math.sqrt(k.size(-1)))
+            # create mask for preventing future tokens from leaking in
+            # Use -inf here to remove instead of zero as next step is softmax
+            attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+            # Softmax over each column
+            attn = F.softmax(attn, dim=-1)
+            # (B, num_head, T, T) x (B, num_head, T, dim_attn)
+            # = (B, num_head, T, dim_attn)
+            y = attn @ v
+
+        with record_function("attn:head"):
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+        # Re-assemble all attention heads
+        # Map it back from dim_attn to dim_embd
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y
-        # Re-assemble all attention heads
-        # Map it back from dim_attn to dim_embd
 
 
 class Block(nn.Module):
@@ -112,7 +117,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024  # context length
-    vocab_size: int = 50257  # 50K BPE, 256 byte tokens, 1 Special (EOT)
+    vocab_size: int = 50304  # 50K BPE, 256 byte tokens, 1 Special (EOT)
     n_layer: int = 12  # how many consecutive transformer blocks
     n_head: int = 12  # how many self-attention heads per transformer
     n_embd: int = 768  # dimentionality of embeddings
@@ -326,7 +331,7 @@ def run_model():
 
     train_loader = DataLoaderLite(B=16, T=1024)
 
-    model = GPT(GPTConfig)
+    model = GPT(GPTConfig())
     model.eval()
     model.to(device)
 
