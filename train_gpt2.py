@@ -113,7 +113,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024  # context length
-    vocab_size: int = 50257  # 50K BPE, 256 byte tokens, 1 Special (EOT)
+    vocab_size: int = 50304  # 50K BPE, 256 byte tokens, 1 Special (EOT)
     n_layer: int = 12  # how many consecutive transformer blocks
     n_head: int = 12  # how many self-attention heads per transformer
     n_embd: int = 768  # dimentionality of embeddings
@@ -319,7 +319,7 @@ def run_model():
 
     train_loader = DataLoaderLite(B=16, T=1024)
 
-    model = GPT.from_pretrained("gpt2")
+    model = GPT(GPTConfig())
     model.eval()
     model.to(device)
     model = torch.compile(model)
