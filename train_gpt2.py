@@ -3,6 +3,7 @@ from typing import assert_type
 
 import math
 import os
+import time
 
 import torch
 from torch._prims_common import DeviceLikeType
@@ -24,6 +25,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate="tanh")
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -41,6 +43,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # holds V_up to go from attention-space back to token-space
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -128,6 +131,19 @@ class GPT(nn.Module):
         )
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, "NANOGPT_SCALE_INIT"):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         B, T = idx.size()
@@ -277,11 +293,8 @@ def _generate_next_token(model: nn.Module, x: torch.Tensor):
     x = torch.cat((x, xcol), dim=1)
 
 
-@app.function(gpu="L40S", image=image)
+@app.function(gpu="A100", image=image)
 def run_model():
-    NUM_SEQUENCES = 5
-    MAX_LENGTH = 30
-
     if not os.path.exists("input.txt"):
         import requests
 
@@ -290,28 +303,42 @@ def run_model():
             f.write(requests.get(url).text)
             print("Downloaded tiny shakespeare dataset")
 
+    torch.manual_seed(1337)
     if torch.backends.mps.is_available() and torch.backends.mps.is_built():
         device = torch.device("mps")
+        torch.mps.manual_seed(1337)
     elif torch.backends.cuda.is_built():
         device = torch.device("cuda")
+        torch.cuda.manual_seed(1337)
     else:
         device = torch.device("cpu")
+
+    train_loader = DataLoaderLite(B=16, T=1024)
 
     model = GPT.from_pretrained("gpt2")
     model.eval()
     model.to(device)
 
-    train_loader = DataLoaderLite(B=4, T=32)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
-    for i in range(50):
+    for i in range(10):
+        t0 = time.time()
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
-        logits, loss = model(x, y)
+        _, loss = model(x, y)
         loss.backward()
         optimizer.step()
-        print(f"step {i}, loss: {loss.item()}")
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elif torch.mps.is_available():
+            torch.mps.synchronize()
+        t1 = time.time()
+        dt = (t1 - t0) * 1000
+        tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+        print(
+            f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}"
+        )
 
 
 @app.local_entrypoint()
