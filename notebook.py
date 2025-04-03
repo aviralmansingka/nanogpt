@@ -47,7 +47,8 @@ def _(plt, sd_hf):
 @app.cell
 def _():
     from transformers import pipeline, set_seed
-    generator = pipeline('text-generation', model='gpt2')
+
+    generator = pipeline("text-generation", model="gpt2")
     set_seed(1337)
     generator("Hello, I'm a language model,", max_length=30, num_return_sequences=5)
     return generator, pipeline, set_seed
