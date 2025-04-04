@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import assert_type
 
 import inspect
 import math
@@ -7,7 +6,11 @@ import os
 import time
 
 import torch
+<<<<<<< HEAD
 from torch.profiler import profile, ProfilerActivity, record_function, schedule
+=======
+from torch.profiler import profile, record_function, ProfilerActivity
+>>>>>>> b46635e (Adding profiling)
 import torch.nn as nn
 from torch.nn import functional as F
 
@@ -340,7 +343,7 @@ def _generate_next_token(model: nn.Module, x: torch.Tensor):
 MAX_LR = 3e-4
 MIN_LR = MAX_LR * 0.1
 WARMUP_STEPS = 10
-MAX_STEPS = 50
+MAX_STEPS = 5
 
 
 def get_lr(it):
@@ -383,7 +386,7 @@ def run_model():
     model = GPT(GPTConfig())
     model.eval()
     model.to(device)
-    model: GPT = torch.compile(model)
+    model = torch.compile(model)
 
     optimizer = model.configure_optimizers(
         weight_decay=0.1, learning_rate=6e-4, device=device
