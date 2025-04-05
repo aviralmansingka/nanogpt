@@ -6,11 +6,7 @@ import os
 import time
 
 import torch
-<<<<<<< HEAD
 from torch.profiler import profile, ProfilerActivity, record_function, schedule
-=======
-from torch.profiler import profile, record_function, ProfilerActivity
->>>>>>> b46635e (Adding profiling)
 import torch.nn as nn
 from torch.nn import functional as F
 
@@ -381,12 +377,17 @@ def run_model():
     else:
         device = "cpu"
 
-    train_loader = DataLoaderLite(B=16, T=1024)
+    total_batch_size = 524288
+    B = 16  # microbatch size
+    T = 1024  # max context length
+    grad_accum_steps = total_batch_size // (B * T)
+
+    train_loader = DataLoaderLite(B=B, T=T)
 
     model = GPT(GPTConfig())
     model.eval()
     model.to(device)
-    model = torch.compile(model)
+    # model = torch.compile(model)
 
     optimizer = model.configure_optimizers(
         weight_decay=0.1, learning_rate=6e-4, device=device
@@ -402,35 +403,45 @@ def run_model():
         prof.start()
         optimizer.zero_grad()
         for step in range(10):
-            t0 = time.time()
-            with record_function("load_data"):
-                x, y = train_loader.next_batch()
-                x, y = x.to(device), y.to(device)
-            with record_function("next_token_pred"):
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    _, loss = model(x, y)
+            with record_function("batch"):
+                loss_accum = 0.0
+                t0 = time.time()
+                for micro_step in range(grad_accum_steps):
+                    with record_function("load_data"):
+                        x, y = train_loader.next_batch()
+                        x, y = x.to(device), y.to(device)
 
-            with record_function("grad_update"):
-                loss.backward()
-                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                lr = get_lr(step)
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = lr
-                optimizer.step()
-                optimizer.zero_grad()
+                    with record_function("next_token_pred"):
+                        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                            _, loss = model(x, y)
 
-            with record_function("cleanup"):
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                elif torch.mps.is_available():
-                    torch.mps.synchronize()
-                t1 = time.time()
-                dt = (t1 - t0) * 1000
-                tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-                print(
-                    f"step {step} | loss: {loss.item()} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
-                )
-                prof.step()
+                    with record_function("loss_accum"):
+                        loss = loss / grad_accum_steps
+                        loss_accum += loss.detach()
+                        loss.backward()
+                        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        lr = get_lr(step)
+                        for param_group in optimizer.param_groups:
+                            param_group["lr"] = lr
+
+                with record_function("grad_update"):
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                with record_function("cleanup"):
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    elif torch.mps.is_available():
+                        torch.mps.synchronize()
+                    t1 = time.time()
+                    dt = (t1 - t0) * 1000
+                    tokens_per_sec = (
+                        grad_accum_steps * train_loader.B * train_loader.T
+                    ) / (t1 - t0)
+                    print(
+                        f"step {step} | loss: {loss_accum.item()} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
+                    )
+            prof.step()
 
     prof.export_chrome_trace(f"/mnt/traces/trace_{time.strftime('%Y%m%d_%H%M%S')}.json")
 
