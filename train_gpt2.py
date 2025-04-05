@@ -426,9 +426,9 @@ def run_model():
 
                 with record_function("grad_update"):
                     optimizer.step()
-                    optimizer.zero_grad()
 
                 with record_function("cleanup"):
+                    optimizer.zero_grad()
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     elif torch.mps.is_available():
