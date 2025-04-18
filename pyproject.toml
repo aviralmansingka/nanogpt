@@ -1,0 +1,6 @@
+[tool.basedpyright]
+
+reportUnreachable = false
+reportOptionalMemberAccess = false
+strictDictionaryInference = true
+
