@@ -154,9 +154,9 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None):
         B, T = idx.size()
-        assert T <= self.config.block_size, (
-            f"Cannot forward sequence of length {T}, block_size is only {self.config.block_size}"
-        )
+        assert (
+            T <= self.config.block_size
+        ), f"Cannot forward sequence of length {T}, block_size is only {self.config.block_size}"
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
         with record_function("GPT::embeddings"):
             # Static position embeddings irrespective of inputs
@@ -234,9 +234,9 @@ class GPT(nn.Module):
         ]
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), (
-            f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-        )
+        assert len(sd_keys_hf) == len(
+            sd_keys
+        ), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
@@ -356,7 +356,7 @@ def get_lr(it):
     return MIN_LR + coeff * (MAX_LR - MIN_LR)
 
 
-@app.function(gpu="A100", image=image, volumes={"/mnt/traces": traces})
+@app.function(gpu="H100", image=image, volumes={"/mnt/traces": traces})
 def run_model():
     if not os.path.exists("input.txt"):
         import requests
@@ -366,6 +366,12 @@ def run_model():
             f.write(requests.get(url).text)
             print("Downloaded tiny shakespeare dataset")
 
+    torch.cuda.memory._record_memory_history(
+        enabled="all",  # Track alloc and free calls
+        context="all",  # Include all context information
+        stacks="all",  # Include both Python and C++ stack traces
+        max_entries=100000,  # Limit memory history size
+    )
     torch.set_float32_matmul_precision("high")
     torch.manual_seed(1337)
     if torch.backends.mps.is_available() and torch.backends.mps.is_built():
@@ -377,9 +383,9 @@ def run_model():
     else:
         device = "cpu"
 
-    total_batch_size = 524288
     B = 16  # microbatch size
     T = 1024  # max context length
+    total_batch_size = 512 * T
     grad_accum_steps = total_batch_size // (B * T)
 
     train_loader = DataLoaderLite(B=B, T=T)
@@ -397,6 +403,8 @@ def run_model():
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         with_modules=True,
         with_flops=True,
+        with_stack=True,
+        profile_memory=True,
         record_shapes=True,
         schedule=schedule(wait=1, warmup=1, active=2, repeat=1),
     ) as prof:
@@ -428,7 +436,7 @@ def run_model():
                     optimizer.step()
 
                 with record_function("cleanup"):
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     elif torch.mps.is_available():
@@ -443,7 +451,15 @@ def run_model():
                     )
             prof.step()
 
-    prof.export_chrome_trace(f"/mnt/traces/trace_{time.strftime('%Y%m%d_%H%M%S')}.json")
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    prof.export_chrome_trace(f"/mnt/traces/trace_{ts}.json")
+    prof.export_memory_timeline(f"/mnt/traces/memory_{ts}.html", device=device)
+
+    # Step 3: Dump the snapshot to a pickle file
+    torch.cuda.memory._dump_snapshot(f"/mnt/traces/memory_{ts}.pkl")
+
+    # Step 4: Disable memory history recording
+    torch.cuda.memory._record_memory_history(enabled=None)
 
 
 @app.local_entrypoint()
